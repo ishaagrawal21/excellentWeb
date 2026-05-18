@@ -1,393 +1,508 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import "./App.css";
-import type { AuthState, Task, TaskStatus, UserRole } from "./types";
-import { login as apiLogin, fetchTasks, createTask, updateTaskStatus } from "./apiClient";
+import type { Task, TaskStatus, Activity, TaskStats } from "./types";
+import { fetchTasks, createTask, updateTaskStatus, fetchStats, fetchActivities } from "./apiClient";
 import { createSocket } from "./socket";
 
-function loadAuthFromStorage(): AuthState | null {
-  const raw = localStorage.getItem("auth");
-  if (!raw) return null;
-  try {
-    return JSON.parse(raw) as AuthState;
-  } catch {
-    return null;
-  }
-}
-
-function saveAuthToStorage(auth: AuthState | null) {
-  if (!auth) {
-    localStorage.removeItem("auth");
-    return;
-  }
-  localStorage.setItem("auth", JSON.stringify(auth));
-}
-
 function App() {
-  const [auth, setAuth] = useState<AuthState | null>(() => loadAuthFromStorage());
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [activities, setActivities] = useState<Activity[]>([]);
+  const [stats, setStats] = useState<TaskStats | null>(null);
+  const [isConnected, setIsConnected] = useState(false);
+
+  // Form states
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [status, setStatus] = useState<TaskStatus>("todo");
+  const [tagsInput, setTagsInput] = useState("");
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notification, setNotification] = useState<string | null>(null);
+  const [toast, setToast] = useState<{ message: string; action: string } | null>(null);
+  const [expandedHistory, setExpandedHistory] = useState<Record<string, boolean>>({});
 
-  const isAdmin = auth?.user.role === "admin";
+  const toggleHistory = (taskId: string) => {
+    setExpandedHistory((prev) => ({
+      ...prev,
+      [taskId]: !prev[taskId],
+    }));
+  };
 
+  // Initial load
   useEffect(() => {
-    saveAuthToStorage(auth);
-  }, [auth]);
-
-  useEffect(() => {
-    if (!auth) return;
-
     setLoading(true);
-    fetchTasks(auth.token)
-      .then(setTasks)
-      .catch(() => setError("Failed to load tasks"))
+    Promise.all([fetchTasks(), fetchActivities(), fetchStats()])
+      .then(([tasksData, activitiesData, statsData]) => {
+        setTasks(tasksData);
+        setActivities(activitiesData);
+        setStats(statsData);
+      })
+      .catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error("Failed to load initial data", err);
+        setError("Could not connect to the backend server. Please verify MongoDB and Express are running.");
+      })
       .finally(() => setLoading(false));
-  }, [auth]);
+  }, []);
 
+  // Socket integration
   useEffect(() => {
-    if (!auth) return;
-    const socket = createSocket(auth.token);
+    const socket = createSocket();
 
     socket.on("connect", () => {
-      // console.log("Socket connected");
-    });
-
-    socket.on("task:assigned", (task: Task) => {
-      setTasks((prev) => {
-        const exists = prev.find((t) => t._id === task._id);
-        if (exists) {
-          return prev.map((t) => (t._id === task._id ? task : t));
-        }
-        return [task, ...prev];
-      });
-      setNotification(`New task assigned: ${task.title}`);
-      setTimeout(() => setNotification(null), 4000);
+      setIsConnected(true);
     });
 
     socket.on("disconnect", () => {
-      // console.log("Socket disconnected");
+      setIsConnected(false);
+    });
+
+    socket.on("taskCreated", (task: Task) => {
+      setTasks((prev) => {
+        if (prev.some((t) => t._id === task._id)) return prev;
+        return [task, ...prev];
+      });
+      // Fetch fresh database stats
+      fetchStats().then(setStats).catch(console.error);
+
+      // Trigger a toast notification
+      setToast({
+        message: `Task "${task.title}" was created!`,
+        action: "Created",
+      });
+      setTimeout(() => setToast(null), 4000);
+    });
+
+    socket.on("taskUpdated", (task: Task) => {
+      setTasks((prev) => prev.map((t) => (t._id === task._id ? task : t)));
+      // Fetch fresh database stats
+      fetchStats().then(setStats).catch(console.error);
+    });
+
+    socket.on("activityCreated", (activity: Activity) => {
+      setActivities((prev) => {
+        if (prev.some((a) => a._id === activity._id)) return prev;
+        return [activity, ...prev];
+      });
+
+      if (activity.action === "taskUpdated") {
+        setToast({
+          message: activity.details,
+          action: "Updated",
+        });
+        setTimeout(() => setToast(null), 4000);
+      }
     });
 
     return () => {
       socket.disconnect();
     };
-  }, [auth]);
+  }, []);
 
-  const handleLogout = () => {
-    setAuth(null);
-    setTasks([]);
+  const handleCreateTask = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!title.trim()) return;
+
+    try {
+      const tags = tagsInput
+        .split(",")
+        .map((tag) => tag.trim())
+        .filter(Boolean);
+
+      await createTask({
+        title: title.trim(),
+        description: description.trim(),
+        status,
+        tags,
+      });
+
+      // Clear Form
+      setTitle("");
+      setDescription("");
+      setStatus("todo");
+      setTagsInput("");
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("Error creating task", err);
+      alert("Failed to create task");
+    }
   };
 
-  if (!auth) {
+  const handleUpdateStatus = async (id: string, newStatus: TaskStatus) => {
+    try {
+      await updateTaskStatus(id, newStatus);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error("Error updating task status", err);
+      alert("Failed to update status");
+    }
+  };
+
+  const formatTime = (isoString: string) => {
+    try {
+      const date = new Date(isoString);
+      return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    } catch {
+      return "";
+    }
+  };
+
+  const formatDate = (isoString: string) => {
+    try {
+      const date = new Date(isoString);
+      return date.toLocaleDateString([], { month: "short", day: "numeric" });
+    } catch {
+      return "";
+    }
+  };
+
+  // Groups
+  const todoTasks = tasks.filter((t) => t.status === "todo");
+  const inProgressTasks = tasks.filter((t) => t.status === "in-progress");
+  const doneTasks = tasks.filter((t) => t.status === "done");
+
+  const renderTaskCard = (task: Task) => {
+    const taskHistory = activities.filter((act) => act.taskId === task._id);
+    const isExpanded = expandedHistory[task._id] || false;
+
     return (
-      <div className="app">
-        <LoginForm
-          onLoginSuccess={(data) => {
-            setAuth({ token: data.token, user: data.user });
-          }}
-        />
+      <div key={task._id} className={`task-card ${task.status}`}>
+        <div className="task-card-header">
+          <h3 
+            className="task-card-title" 
+            style={task.status === "done" ? { textDecoration: "line-through", opacity: 0.75 } : {}}
+          >
+            {task.title}
+          </h3>
+        </div>
+        
+        {task.description && (
+          <p 
+            className="task-card-desc" 
+            style={task.status === "done" ? { opacity: 0.7 } : {}}
+          >
+            {task.description}
+          </p>
+        )}
+        
+        {task.tags && task.tags.length > 0 && (
+          <div className="task-card-tags">
+            {task.tags.map((tag, idx) => (
+              <span key={idx} className="tag-chip">
+                #{tag}
+              </span>
+            ))}
+          </div>
+        )}
+        
+        {/* Horizontal Status Stepper */}
+        <div className="task-stepper-container">
+          <div className="task-stepper">
+            <div className="stepper-line">
+              <div className={`stepper-line-fill ${task.status}`} />
+            </div>
+            
+            <button 
+              type="button"
+              className={`step-btn todo ${task.status === "todo" || task.status === "in-progress" || task.status === "done" ? "active" : ""}`}
+              onClick={() => handleUpdateStatus(task._id, "todo")}
+              title="Move to Todo"
+            >
+              <span className="step-circle">
+                {task.status === "in-progress" || task.status === "done" ? "✓" : "1"}
+              </span>
+              <span className="step-label">Todo</span>
+            </button>
+            
+            <button 
+              type="button"
+              className={`step-btn in-progress ${task.status === "in-progress" || task.status === "done" ? "active" : ""}`}
+              onClick={() => handleUpdateStatus(task._id, "in-progress")}
+              title="Move to In Progress"
+            >
+              <span className="step-circle">
+                {task.status === "done" ? "✓" : "2"}
+              </span>
+              <span className="step-label">Progress</span>
+            </button>
+            
+            <button 
+              type="button"
+              className={`step-btn done ${task.status === "done" ? "active" : ""}`}
+              onClick={() => handleUpdateStatus(task._id, "done")}
+              title="Mark as Done"
+            >
+              <span className="step-circle">
+                {task.status === "done" ? "✓" : "3"}
+              </span>
+              <span className="step-label">Done</span>
+            </button>
+          </div>
+        </div>
+
+        {/* Card Actions / Footer */}
+        <div className="task-card-actions">
+          <span className="task-card-date">{formatDate(task.createdAt)}</span>
+          <button 
+            type="button"
+            className={`history-toggle-btn ${isExpanded ? "expanded" : ""}`}
+            onClick={() => toggleHistory(task._id)}
+            title="View Task History Timeline"
+          >
+            ⏳ Steps Feed <span className="history-badge">{taskHistory.length}</span>
+          </button>
+        </div>
+
+        {/* Collapsible History Steps Timeline */}
+        {isExpanded && (
+          <div className="task-history-timeline">
+            <div className="timeline-container">
+              {taskHistory.map((act) => (
+                <div key={act._id} className="timeline-step">
+                  <div className="timeline-step-indicator">
+                    <div className="timeline-line-connector" />
+                    <div className={`timeline-badge ${act.action === "taskCreated" ? "created" : "updated"}`}>
+                      {act.action === "taskCreated" ? "+" : "⚙"}
+                    </div>
+                  </div>
+                  <div className="timeline-step-content glass-panel">
+                    <p className="timeline-step-details">{act.details}</p>
+                    <span className="timeline-step-time">{formatTime(act.createdAt)}</span>
+                  </div>
+                </div>
+              ))}
+              {taskHistory.length === 0 && (
+                <p className="timeline-empty">No logged steps for this task yet.</p>
+              )}
+            </div>
+          </div>
+        )}
       </div>
     );
-  }
+  };
 
   return (
     <div className="app">
-      <header className="app-header">
-        <div className="brand">
-          <div className="brand-logo">TM</div>
-          <div className="brand-text">
-            <span className="brand-title">Task Management</span>
-            <span className="brand-subtitle">
-              Lightweight MERN stack task manager with real-time updates
-            </span>
-          </div>
-        </div>
-        <p>
-          Logged in as <strong>{auth.user.username}</strong> ({auth.user.role})
-        </p>
-        <button className="button secondary" onClick={handleLogout}>
-          Logout
-        </button>
-      </header>
-
-      {notification && (
+      {/* Toast Notification */}
+      {toast && (
         <div className="notification">
-          <div className="notification-icon">!</div>
-          <div className="notification-content">
-            <span className="notification-title">Task assigned</span>
-            <span className="notification-message">{notification}</span>
+          <div className="notification-badge">
+            {toast.action === "Created" ? "+" : "✓"}
           </div>
-          <button
-            type="button"
-            className="notification-close"
-            onClick={() => setNotification(null)}
-          >
+          <div className="notification-desc">{toast.message}</div>
+          <button className="notification-close" onClick={() => setToast(null)}>
             ×
           </button>
         </div>
       )}
+
+      {/* Header Panel */}
+      <header className="app-header glass-panel">
+        <div className="brand">
+          <div className="brand-logo">T</div>
+          <div className="brand-text">
+            <span className="brand-title">Taskly</span>
+            <span className="brand-subtitle">Real-time collaboration task board</span>
+          </div>
+        </div>
+
+        <div className="connection-status">
+          <span className={`status-dot ${isConnected ? "connected" : "disconnected"}`} />
+          <span>{isConnected ? "Live Socket Connected" : "Connecting..."}</span>
+        </div>
+      </header>
+
+      {/* Connection / Initializing Error */}
       {error && <div className="error">{error}</div>}
 
-      <main className="layout">
-        {isAdmin && (
-          <section className="panel">
-            <h2>Create & Assign Task</h2>
-            <CreateTaskForm
-              currentUserId={auth.user.id}
-              token={auth.token}
-              onCreated={(task) => setTasks((prev) => [task, ...prev])}
-            />
-          </section>
-        )}
+      {/* Stats Board */}
+      <section className="stats-grid">
+        <div className="stat-card glass-panel">
+          <div className="stat-icon">📊</div>
+          <div className="stat-info">
+            <span className="stat-label">Total Tasks</span>
+            <span className="stat-value">{stats?.totalTasks ?? 0}</span>
+          </div>
+        </div>
 
-        <section className="panel">
-          <h2>{isAdmin ? "All Tasks" : "My Tasks"}</h2>
-          {loading ? (
-            <p>Loading tasks...</p>
-          ) : (
-            <TaskList
-              tasks={tasks}
-              role={auth.user.role}
-              token={auth.token}
-              onTaskUpdated={(task) =>
-                setTasks((prev) => prev.map((t) => (t._id === task._id ? task : t)))
-              }
-            />
-          )}
+        <div className="stat-card glass-panel">
+          <div className="stat-icon">📝</div>
+          <div className="stat-info">
+            <span className="stat-label">Todo</span>
+            <span className="stat-value">{stats?.countByStatus.todo ?? 0}</span>
+          </div>
+        </div>
+
+        <div className="stat-card glass-panel">
+          <div className="stat-icon">⚡</div>
+          <div className="stat-info">
+            <span className="stat-label">In Progress</span>
+            <span className="stat-value">{stats?.countByStatus["in-progress"] ?? 0}</span>
+          </div>
+        </div>
+
+        <div className="stat-card glass-panel">
+          <div className="stat-icon">✅</div>
+          <div className="stat-info">
+            <span className="stat-label">Completed</span>
+            <span className="stat-value">{stats?.countByStatus.done ?? 0}</span>
+          </div>
+        </div>
+
+        <div className="stat-card glass-panel">
+          <div className="stat-icon">🏷️</div>
+          <div className="stat-info">
+            <span className="stat-label">Top Tag</span>
+            <span className="stat-value">
+              {stats?.mostCommonTag ? (
+                <span className="stat-tag-badge">#{stats.mostCommonTag}</span>
+              ) : (
+                "None"
+              )}
+            </span>
+          </div>
+        </div>
+      </section>
+
+      {/* Main Board Layout */}
+      <main className="layout">
+        {/* Left Side: Create Task Form */}
+        <section className="glass-panel form-panel">
+          <h2 className="panel-title">Add New Task</h2>
+          <form className="form-vertical" onSubmit={handleCreateTask}>
+            <div className="field">
+              <label htmlFor="task-title">Title</label>
+              <input
+                id="task-title"
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="e.g. Implement WebSocket logic"
+                required
+                disabled={loading}
+              />
+            </div>
+
+            <div className="field">
+              <label htmlFor="task-desc">Description</label>
+              <textarea
+                id="task-desc"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                placeholder="Details about what needs to be done..."
+                disabled={loading}
+              />
+            </div>
+
+            <div className="field">
+              <label htmlFor="task-status">Initial Status</label>
+              <select
+                id="task-status"
+                value={status}
+                onChange={(e) => setStatus(e.target.value as TaskStatus)}
+                disabled={loading}
+              >
+                <option value="todo">Todo</option>
+                <option value="in-progress">In Progress</option>
+                <option value="done">Completed</option>
+              </select>
+            </div>
+
+            <div className="field">
+              <label htmlFor="task-tags">Tags (Comma-separated)</label>
+              <input
+                id="task-tags"
+                value={tagsInput}
+                onChange={(e) => setTagsInput(e.target.value)}
+                placeholder="e.g. backend, bug, websocket"
+                disabled={loading}
+              />
+            </div>
+
+            <button className="button" type="submit" disabled={loading || !title.trim()}>
+              <span>+</span> Create Task
+            </button>
+          </form>
+        </section>
+
+        {/* Middle Area: Kanban Columns */}
+        <section className="kanban-board-container board-panel">
+          <div className="kanban-board">
+            {/* Column 1: Todo */}
+            <div className="kanban-column todo">
+              <div className="column-header">
+                <span className="column-title">Todo</span>
+                <span className="column-count">{todoTasks.length}</span>
+              </div>
+              <div className="column-cards">
+                {todoTasks.map(renderTaskCard)}
+                {todoTasks.length === 0 && (
+                  <p style={{ color: "var(--text-muted)", fontSize: "0.85rem", textAlign: "center", marginTop: "2rem" }}>
+                    No tasks in Todo
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {/* Column 2: In Progress */}
+            <div className="kanban-column in-progress">
+              <div className="column-header">
+                <span className="column-title">In Progress</span>
+                <span className="column-count">{inProgressTasks.length}</span>
+              </div>
+              <div className="column-cards">
+                {inProgressTasks.map(renderTaskCard)}
+                {inProgressTasks.length === 0 && (
+                  <p style={{ color: "var(--text-muted)", fontSize: "0.85rem", textAlign: "center", marginTop: "2rem" }}>
+                    No tasks in Progress
+                  </p>
+                )}
+              </div>
+            </div>
+
+            {/* Column 3: Done */}
+            <div className="kanban-column done">
+              <div className="column-header">
+                <span className="column-title">Completed</span>
+                <span className="column-count">{doneTasks.length}</span>
+              </div>
+              <div className="column-cards">
+                {doneTasks.map(renderTaskCard)}
+                {doneTasks.length === 0 && (
+                  <p style={{ color: "var(--text-muted)", fontSize: "0.85rem", textAlign: "center", marginTop: "2rem" }}>
+                    No completed tasks
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        </section>
+
+        {/* Right Side: Activity Feed */}
+        <section className="glass-panel feed-panel">
+          <h2 className="panel-title">
+            Live Feed <span className="count-badge">{activities.length}</span>
+          </h2>
+          <div className="activity-list">
+            {activities.map((act) => (
+              <div key={act._id} className="activity-item">
+                <div className={`activity-avatar ${act.action === "taskCreated" ? "created" : "updated"}`}>
+                  {act.action === "taskCreated" ? "+" : "⚙"}
+                </div>
+                <div className="activity-content">
+                  <span className="activity-header">{act.details}</span>
+                  <span className="activity-time">{formatTime(act.createdAt)}</span>
+                </div>
+              </div>
+            ))}
+            {activities.length === 0 && (
+              <p style={{ color: "var(--text-muted)", fontSize: "0.85rem", textAlign: "center", marginTop: "2rem" }}>
+                No recent activity logs
+              </p>
+            )}
+          </div>
         </section>
       </main>
     </div>
-  );
-}
-
-interface LoginFormProps {
-  onLoginSuccess: (data: Awaited<ReturnType<typeof apiLogin>>) => void;
-}
-
-function LoginForm({ onLoginSuccess }: LoginFormProps) {
-  const [username, setUsername] = useState("admin");
-  const [password, setPassword] = useState("password");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    setError(null);
-    try {
-      const data = await apiLogin(username, password);
-      onLoginSuccess(data);
-    } catch (err) {
-      console.error(err);
-      setError("Invalid credentials");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <div className="auth-container">
-      <form className="card" onSubmit={handleSubmit}>
-        <h1 className="auth-title">Login</h1>
-        <div className="field">
-          <label>Username</label>
-          <input
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            placeholder="admin / alice / bob"
-          />
-        </div>
-        <div className="field">
-          <label>Password</label>
-          <input
-            type="password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            placeholder="password"
-          />
-        </div>
-        {error && <div className="error">{error}</div>}
-        <button className="button primary" type="submit" disabled={loading}>
-          {loading ? "Logging in..." : "Login"}
-        </button>
-        <p className="hint">
-          Use <strong>admin</strong> (role: admin) or <strong>alice / bob</strong> (role:
-          user), password: <strong>password</strong>.
-        </p>
-      </form>
-    </div>
-  );
-}
-
-interface CreateTaskFormProps {
-  currentUserId: string;
-  token: string;
-  onCreated: (task: Task) => void;
-}
-
-function CreateTaskForm({ token, onCreated }: CreateTaskFormProps) {
-  const [title, setTitle] = useState("");
-  const [assignedTo, setAssignedTo] = useState("user1");
-  const [status, setStatus] = useState<TaskStatus>("todo");
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoading(true);
-    setError(null);
-    try {
-      const task = await createTask(token, { title, assignedTo, status });
-      onCreated(task);
-      setTitle("");
-      setStatus("todo");
-    } catch (err) {
-      console.error(err);
-      setError("Failed to create task");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  return (
-    <form className="form-vertical" onSubmit={handleSubmit}>
-      <div className="field">
-        <label>Title</label>
-        <input
-          value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          placeholder="Implement feature X"
-        />
-      </div>
-      <div className="field">
-        <label>Assign To</label>
-        <select value={assignedTo} onChange={(e) => setAssignedTo(e.target.value)}>
-          <option value="user1">alice (user1)</option>
-          <option value="user2">bob (user2)</option>
-        </select>
-      </div>
-      <div className="field">
-        <label>Status</label>
-        <select
-          value={status}
-          onChange={(e) => setStatus(e.target.value as TaskStatus)}
-        >
-          <option value="todo">Todo</option>
-          <option value="in-progress">In progress</option>
-          <option value="done">Done</option>
-        </select>
-      </div>
-      {error && <div className="error">{error}</div>}
-      <button className="button primary" type="submit" disabled={loading || !title}>
-        {loading ? "Creating..." : "Create Task"}
-      </button>
-    </form>
-  );
-}
-
-interface TaskListProps {
-  tasks: Task[];
-  role: UserRole;
-  token: string;
-  onTaskUpdated: (task: Task) => void;
-}
-
-function TaskList({ tasks, role, token, onTaskUpdated }: TaskListProps) {
-  if (tasks.length === 0) {
-    return <p>No tasks yet.</p>;
-  }
-
-  const canUpdate = role === "user";
-
-  return (
-    <ul className="task-list">
-      {tasks.map((task) => (
-        <TaskItem
-          key={task._id}
-          task={task}
-          canUpdate={canUpdate}
-          token={token}
-          onUpdated={onTaskUpdated}
-        />
-      ))}
-    </ul>
-  );
-}
-
-interface TaskItemProps {
-  task: Task;
-  canUpdate: boolean;
-  token: string;
-  onUpdated: (task: Task) => void;
-}
-
-function TaskItem({ task, canUpdate, token, onUpdated }: TaskItemProps) {
-  const [saving, setSaving] = useState(false);
-
-  const displayAssignee = useMemo(() => {
-    // Map ids user1/user2
-    if (task.assignedTo === "user1") return "alice";
-    if (task.assignedTo === "user2") return "bob";
-    return task.assignedTo;
-  }, [task.assignedTo]);
-
-  const handleChangeStatus = async (status: TaskStatus) => {
-    try {
-      setSaving(true);
-      const updated = await updateTaskStatus(token, task._id, status);
-      onUpdated(updated);
-    } catch (err) {
-      console.error(err);
-      alert("Failed to update task status");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const statusClass = useMemo(() => {
-    switch (task.status) {
-      case "todo":
-        return "pill pill-gray";
-      case "in-progress":
-        return "pill pill-blue";
-      case "done":
-        return "pill pill-green";
-      default:
-        return "pill";
-    }
-  }, [task.status]);
-
-  return (
-    <li className="task-item">
-      <div className="task-main">
-        <h3>{task.title}</h3>
-        <p className="meta">
-          Assigned to:{" "}
-          <span className="avatar-chip">
-            <span className="avatar-circle">
-              {displayAssignee.charAt(0).toUpperCase()}
-            </span>
-            <span>{displayAssignee}</span>
-          </span>
-        </p>
-      </div>
-      <div className="task-actions">
-        <span className={statusClass}>{task.status}</span>
-        {canUpdate && (
-          <select
-            className="status-select"
-            disabled={saving}
-            value={task.status}
-            onChange={(e) => handleChangeStatus(e.target.value as TaskStatus)}
-          >
-            <option value="todo">Todo</option>
-            <option value="in-progress">In progress</option>
-            <option value="done">Done</option>
-          </select>
-        )}
-      </div>
-    </li>
   );
 }
 

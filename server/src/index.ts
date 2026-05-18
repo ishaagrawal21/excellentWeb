@@ -27,23 +27,6 @@ async function bootstrap(): Promise<void> {
     },
   });
 
-  // Socket.io authentication using JWT passed in auth.token
-  io.use((socket, next) => {
-    const token = socket.handshake.auth?.token as string | undefined;
-    if (!token) {
-      return next(new Error("Authentication token missing"));
-    }
-
-    try {
-      const payload = jwt.verify(token, JWT_SECRET) as Express.UserPayload;
-      // @ts-expect-error - we extend socket type at runtime
-      socket.user = payload;
-      socket.join(`user:${payload.userId}`);
-      return next();
-    } catch {
-      return next(new Error("Invalid token"));
-    }
-  });
 
   io.on("connection", (socket) => {
     // eslint-disable-next-line no-console
