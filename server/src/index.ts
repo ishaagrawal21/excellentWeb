@@ -4,15 +4,13 @@ import http from "http";
 import cors from "cors";
 import { Server as SocketIOServer } from "socket.io";
 import { connectDb } from "./config/db";
-import { createAuthRouter } from "./routes/auth";
 import { createTaskRouter } from "./routes/tasks";
-import jwt from "jsonwebtoken";
 
 const PORT = Number(process.env.PORT) || 5000;
 const MONGO_URI =
   process.env.MONGO_URI || "mongodb://127.0.0.1:27017/task_management";
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:5173";
-const JWT_SECRET = process.env.JWT_SECRET || "supersecretjwt";
+
 
 async function bootstrap(): Promise<void> {
   await connectDb(MONGO_URI);
@@ -49,7 +47,6 @@ async function bootstrap(): Promise<void> {
     res.json({ message: "Task Management API running" });
   });
 
-  app.use("/api", createAuthRouter());
   app.use("/api", createTaskRouter(io));
 
   server.listen(PORT, () => {
